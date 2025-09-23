@@ -1,0 +1,266 @@
+# This is a presentation-ready workflow to build a container image and deploy it to Cloud Run.
+# It demonstrates releases, artifacts, environments, and secure OIDC authentication.
+# This version deploys to dev, staging, and production.
+
+name: Release to Cloud Run
+
+# This workflow is triggered *only* when a new GitHub Release is 'created' (published).
+# This is a deliberate, manual step, perfect for production releases.
+on:
+  release:
+    types: [created]
+
+# Environment variables available to all jobs.
+# Use GitHub Variables (in repo settings) for non-secret values.
+env:
+  GCP_REGION: "us-central1" # e.g., us-central1
+  IMAGE_NAME: "my-app"       # Name of your application image
+
+# --- Top-Level Permissions ---
+# This section defines the default permissions granted to the GITHUB_TOKEN for all jobs.
+# We use OIDC (OpenID Connect) for secure, keyless authentication with GCP.
+# 'id-token: write' is required for the OIDC token exchange.
+# 'contents: read' is needed to checkout the code.
+# 'packages: write' is needed to push the container image to GCP Artifact Registry.
+permissions:
+  contents: 'read'
+  id-token: 'write'
+  packages: 'write'
+
+jobs:
+  # ----------------------------------------------------------------
+  # Job 1: Build, Tag, and Push Container Image
+  # ----------------------------------------------------------------
+  build-and-push:
+    name: "Build & Push Image"
+    runs-on: ubuntu-latest
+
+    # This job outputs the full, immutable image reference (with digest)
+    # This ensures the *exact same image* that was built is what gets deployed.
+    outputs:
+      image_ref: ${{ steps.build-and-push.outputs.image_ref }}
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@v4
+
+      # --- Secure GCP Authentication ---
+      # This step authenticates with GCP using Workload Identity Federation (OIDC).
+      # It exchanges a GitHub-issued OIDC token for a short-lived GCP access token.
+      # Requires GitHub Secrets: WIF_PROVIDER and WIF_SERVICE_ACCOUNT
+      - name: "Authenticate to Google Cloud"
+        id: "auth"
+        uses: "google-github-actions/auth@v2"
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }} # e.g., projects/123/locations/global/workloadIdentityPools/my-pool/providers/my-provider
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}   # e.g., my-sa@my-project.iam.gserviceaccount.com
+
+      # --- Configure Docker ---
+      # Sets up the gcloud CLI and configures Docker to authenticate with Artifact Registry.
+      # Requires GitHub Secrets: GCP_PROJECT_ID
+      - name: "Setup Google Cloud SDK"
+        uses: "google-github-actions/setup-gcloud@v2"
+
+      - name: "Configure Docker for Artifact Registry"
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+      # --- Build and Push Image ---
+      # This step builds the Dockerfile and pushes it to Artifact Registry.
+      # It tags the image with the GitHub Release tag (e.g., "v1.2.0") and "latest".
+      # It also outputs the unique image digest.
+      # Requires GitHub Secrets: GCP_PROJECT_ID
+      # Requires GitHub Variables: AR_REPOSITORY (Artifact Registry repo name)
+      - name: "Build, tag, and push container image"
+        id: build-and-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:${{ github.event.release.tag_name }}
+            ${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+          labels: "git-sha=${{ github.sha }}"
+
+      # --- Create Deployment Artifact ---
+      # This step creates a file containing the *exact* image reference, including the
+      # immutable digest from the previous step. This is what we will pass to the deploy jobs.
+      # This demonstrates the 'artifact' feature for passing data between jobs.
+      - name: "Create image reference artifact"
+        id: "create-artifact"
+        run: |
+          IMAGE_REF="${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ vars.AR_REPOSITORY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}"
+          echo "Image reference: $IMAGE_REF"
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo $IMAGE_REF > ./image_ref.txt
+
+      # --- Upload Artifact ---
+      # Uploads the 'image_ref.txt' file as a workflow artifact named 'image-reference'.
+      # The deploy jobs will download this.
+      - name: "Upload image reference artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-reference
+          path: ./image_ref.txt
+
+  # ----------------------------------------------------------------
+  # Job 2: Deploy to Dev Environment
+  # ----------------------------------------------------------------
+  deploy-dev:
+    name: "Deploy to Dev"
+    runs-on: ubuntu-latest
+    needs: build-and-push # This job only runs if 'build-and-push' succeeds.
+
+    # --- GitHub Environment ---
+    # Links to the 'dev' environment in GitHub.
+    # This environment can have its own protection rules or secrets.
+    environment:
+      name: dev
+      url: ${{ steps.deploy.outputs.url }}
+
+    steps:
+      - name: "Authenticate to Google Cloud"
+        id: "auth"
+        uses: "google-github-actions/auth@v2"
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      # --- Download Artifact ---
+      # Downloads the 'image-reference' artifact uploaded by the build job.
+      - name: "Download image reference artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: image-reference
+
+      - name: "Read image reference from artifact"
+        id: "image-ref"
+        run: |
+          IMAGE_REF=$(cat ./image_ref.txt)
+          echo "Deploying image: $IMAGE_REF"
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_ENV
+
+      # --- Deploy to Cloud Run (Dev) ---
+      # Deploys to the *dev* Cloud Run service.
+      # Requires GitHub Variables: CLOUDRUN_SERVICE_DEV
+      - name: "Deploy to Cloud Run (Dev)"
+        id: deploy
+        uses: "google-github-actions/deploy-cloudrun@v2"
+        with:
+          service: ${{ vars.CLOUDRUN_SERVICE_DEV }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.image_ref }}
+          env_vars: |
+            RELEASE_VERSION=${{ github.event.release.tag_name }}
+
+  # ----------------------------------------------------------------
+  # Job 3: Deploy to Staging Environment
+  # ----------------------------------------------------------------
+  deploy-staging:
+    name: "Deploy to Staging"
+    runs-on: ubuntu-latest
+    needs: build-and-push # This job only runs if 'build-and-push' succeeds.
+
+    # --- GitHub Environment ---
+    # This links the job to the 'staging' environment in GitHub.
+    # Environments let you set protection rules (e.g., required reviewers)
+    # and track all deployments to a specific target.
+    # The 'url' will be updated with the live Cloud Run service URL.
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}
+
+    steps:
+      - name: "Authenticate to Google Cloud"
+        id: "auth"
+        uses: "google-github-actions/auth@v2"
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      # --- Download Artifact ---
+      # Downloads the 'image-reference' artifact uploaded by the build job.
+      - name: "Download image reference artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: image-reference
+
+      - name: "Read image reference from artifact"
+        id: "image-ref"
+        run: |
+          IMAGE_REF=$(cat ./image_ref.txt)
+          echo "Deploying image: $IMAGE_REF"
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_ENV
+
+      # --- Deploy to Cloud Run (Staging) ---
+      # This step creates a new revision on the *staging* Cloud Run service.
+      # It uses the exact image reference from the artifact.
+      # This action creates a 'GitHub Deployment' event, which shows up in the 'Environments' tab.
+      # Requires GitHub Variables: CLOUDRUN_SERVICE_STAGING
+      - name: "Deploy to Cloud Run (Staging)"
+        id: deploy
+        uses: "google-github-actions/deploy-cloudrun@v2"
+        with:
+          service: ${{ vars.CLOUDRUN_SERVICE_STAGING }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.image_ref }}
+          env_vars: |
+            RELEASE_VERSION=${{ github.event.release.tag_name }}
+
+  # ----------------------------------------------------------------
+  # Job 4: Deploy to Production Environment (with Manual Approval)
+  # ----------------------------------------------------------------
+  deploy-production:
+    name: "Deploy to Production"
+    runs-on: ubuntu-latest
+    needs: [deploy-dev, deploy-staging] # WAITS for both dev and staging to succeed.
+
+    # --- GitHub Environment (Production) ---
+    # This job targets the 'production' environment.
+    # **CRITICAL:** In your repo settings, configure the 'production' environment
+    # to require manual approval. This will cause the workflow to PAUSE here
+    # until a designated reviewer clicks 'Approve'.
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+
+    # --- Concurrency Control ---
+    # Ensures that only one production deployment can run at a time.
+    # If a new release is created while one is in progress, the older one
+    # will be 'canceled' if it's still waiting for approval.
+    concurrency: production
+
+    steps:
+      - name: "Authenticate to Google Cloud"
+        id: "auth"
+        uses: "google-github-actions/auth@v2"
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      # --- Download Artifact (Redundant but good practice) ---
+      # We download the artifact again to ensure the job is self-contained
+      # and deploys the *exact same* image that was built and tested.
+      - name: "Download image reference artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: image-reference
+
+      - name: "Read image reference from artifact"
+        id: "image-ref"
+        run: |
+          IMAGE_REF=$(cat ./image_ref.txt)
+          echo "Deploying image: $IMAGE_REF"
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_ENV
+
+      # --- Deploy to Cloud Run (Production) ---
+      # Deploys the *same* image to the *production* service.
+      # Requires GitHub Variables: CLOUDRUN_SERVICE_PRODUCTION
+      - name: "Deploy to Cloud Run (Production)"
+        id: deploy
+        uses: "google-github-actions/deploy-cloudrun@v2"
+        with:
+          service: ${{ vars.CLOUDRUN_SERVICE_PRODUCTION }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.image_ref }}
+          env_vars: |
+            RELEASE_VERSION=${{ github.event.release.tag_name }}
