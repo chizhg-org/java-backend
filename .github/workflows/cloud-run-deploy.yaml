@@ -1,6 +1,7 @@
 # This is a presentation-ready workflow to build a container image and deploy it to Cloud Run.
 # It demonstrates releases, artifacts, environments, and secure OIDC authentication.
-# This version deploys to dev, staging, and production.
+# This version deploys to dev, staging, and production sequentially.
+# It now specifies a dedicated runtime service account for Cloud Run.
 
 name: Release to Cloud Run
 
@@ -15,6 +16,8 @@ on:
 env:
   GCP_REGION: "us-central1" # e.g., us-central1
   IMAGE_NAME: "my-app"       # Name of your application image
+  # !!! NEW - The email of the service account Cloud Run will RUN AS
+  RUNTIME_SA_EMAIL: "github-actions-runtime-sa@chizhg-vpc-sc-testing.iam.gserviceaccount.com"
 
 # --- Top-Level Permissions ---
 # This section defines the default permissions granted to the GITHUB_TOKEN for all jobs.
@@ -149,6 +152,8 @@ jobs:
           service: ${{ vars.CLOUDRUN_SERVICE_DEV }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.image_ref }}
+          # !!! NEW - Specify the runtime service account
+          service_account: ${{ env.RUNTIME_SA_EMAIL }}
           env_vars: |
             RELEASE_VERSION=${{ github.event.release.tag_name }}
 
@@ -158,7 +163,7 @@ jobs:
   deploy-staging:
     name: "Deploy to Staging"
     runs-on: ubuntu-latest
-    needs: build-and-push # This job only runs if 'build-and-push' succeeds.
+    needs: deploy-dev # This job only runs if 'deploy-dev' succeeds.
 
     # --- GitHub Environment ---
     # This links the job to the 'staging' environment in GitHub.
@@ -203,6 +208,8 @@ jobs:
           service: ${{ vars.CLOUDRUN_SERVICE_STAGING }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.image_ref }}
+          # !!! NEW - Specify the runtime service account
+          service_account: ${{ env.RUNTIME_SA_EMAIL }}
           env_vars: |
             RELEASE_VERSION=${{ github.event.release.tag_name }}
 
@@ -212,7 +219,7 @@ jobs:
   deploy-production:
     name: "Deploy to Production"
     runs-on: ubuntu-latest
-    needs: [deploy-dev, deploy-staging] # WAITS for both dev and staging to succeed.
+    needs: deploy-staging # WAITS for staging to succeed.
 
     # --- GitHub Environment (Production) ---
     # This job targets the 'production' environment.
@@ -262,5 +269,8 @@ jobs:
           service: ${{ vars.CLOUDRUN_SERVICE_PRODUCTION }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.image_ref }}
+          # !!! NEW - Specify the runtime service account
+          service_account: ${{ env.RUNTIME_SA_EMAIL }}
           env_vars: |
             RELEASE_VERSION=${{ github.event.release.tag_name }}
+
