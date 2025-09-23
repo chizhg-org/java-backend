@@ -152,8 +152,8 @@ jobs:
           service: ${{ vars.CLOUDRUN_SERVICE_DEV }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.image_ref }}
-          # !!! NEW - Specify the runtime service account
-          service_account: ${{ env.RUNTIME_SA_EMAIL }}
+          # !!! CORRECTED - Pass the runtime service account as a gcloud flag
+          flags: "--service-account=${{ env.RUNTIME_SA_EMAIL }}"
           env_vars: |
             RELEASE_VERSION=${{ github.event.release.tag_name }}
 
@@ -208,8 +208,8 @@ jobs:
           service: ${{ vars.CLOUDRUN_SERVICE_STAGING }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.image_ref }}
-          # !!! NEW - Specify the runtime service account
-          service_account: ${{ env.RUNTIME_SA_EMAIL }}
+          # !!! CORRECTED - Pass the runtime service account as a gcloud flag
+          flags: "--service-account=${{ env.RUNTIME_SA_EMAIL }}"
           env_vars: |
             RELEASE_VERSION=${{ github.event.release.tag_name }}
 
@@ -269,8 +269,8 @@ jobs:
           service: ${{ vars.CLOUDRUN_SERVICE_PRODUCTION }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.image_ref }}
-          # !!! NEW - Specify the runtime service account
-          service_account: ${{ env.RUNTIME_SA_EMAIL }}
+          # !!! CORRECTED - Pass the runtime service account as a gcloud flag
+          flags: "--service-account=${{ env.RUNTIME_SA_EMAIL }}"
           env_vars: |
             RELEASE_VERSION=${{ github.event.release.tag_name }}
 
